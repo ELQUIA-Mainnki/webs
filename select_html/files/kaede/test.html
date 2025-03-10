@@ -1,0 +1,721 @@
+// Cloudflare Worker編集可能ウェブサイト
+
+// 認証用のシークレットキー（実際には環境変数として設定してください）
+const AUTH_SECRET = "change-this-to-a-secure-secret";
+
+// ユーザーデータを保存するためのKVストア名（Cloudflareのダッシュボードで作成する必要があります）
+// const USERS = YOUR_KV_NAMESPACE; // 実際の使用時にはコメントを外し、適切なKV名前空間を指定してください
+
+// サイトのコンテンツを保存するためのKVストア名
+// const SITE_CONTENT = YOUR_CONTENT_KV_NAMESPACE; // 実際の使用時にはコメントを外し、適切なKV名前空間を指定してください
+
+// JWT署名用のキー（実際には環境変数として設定してください）
+const JWT_SECRET = "change-this-to-a-secure-jwt-secret";
+
+// HTMLテンプレート
+const DEFAULT_CONTENT = {
+  "index": {
+    "title": "ホームページ",
+    "content": "<h1>ようこそ！</h1><p>これは編集可能なウェブサイトです。管理者としてログインすると、このコンテンツを編集できます。</p>"
+  },
+  "about": {
+    "title": "このサイトについて",
+    "content": "<h1>このサイトについて</h1><p>このサイトはCloudflare Workersを使用して作成された編集可能なウェブサイトです。</p>"
+  },
+  "contact": {
+    "title": "お問い合わせ",
+    "content": "<h1>お問い合わせ</h1><p>こちらからお問い合わせください。</p><form id='contact-form'><div><label for='name'>お名前:</label><input type='text' id='name' name='name' required></div><div><label for='email'>メールアドレス:</label><input type='email' id='email' name='email' required></div><div><label for='message'>メッセージ:</label><textarea id='message' name='message' required></textarea></div><button type='submit'>送信</button></form>"
+  }
+};
+
+// JWT関連の関数
+function generateJWT(username, isAdmin) {
+  const header = {
+    alg: "HS256",
+    typ: "JWT"
+  };
+  
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    sub: username,
+    iat: now,
+    exp: now + 3600 * 24, // 24時間有効
+    isAdmin: isAdmin
+  };
+  
+  const headerEncoded = btoa(JSON.stringify(header));
+  const payloadEncoded = btoa(JSON.stringify(payload));
+  
+  const signature = generateSignature(`${headerEncoded}.${payloadEncoded}`, JWT_SECRET);
+  
+  return `${headerEncoded}.${payloadEncoded}.${signature}`;
+}
+
+function verifyJWT(token) {
+  try {
+    const [headerEncoded, payloadEncoded, signature] = token.split('.');
+    
+    // 署名を検証
+    const expectedSignature = generateSignature(`${headerEncoded}.${payloadEncoded}`, JWT_SECRET);
+    if (signature !== expectedSignature) {
+      return null;
+    }
+    
+    const payload = JSON.parse(atob(payloadEncoded));
+    
+    // トークンの有効期限をチェック
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.exp < now) {
+      return null;
+    }
+    
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 簡易的なHMAC-SHA256署名生成関数（実際の環境では適切なライブラリを使用してください）
+function generateSignature(data, secret) {
+  // 注: 実際の実装では、適切な暗号ライブラリを使用するべきです
+  // これは簡易的な実装であり、本番環境では使用しないでください
+  let signature = "";
+  for (let i = 0; i < data.length; i++) {
+    signature += (data.charCodeAt(i) ^ secret.charCodeAt(i % secret.length)).toString(16);
+  }
+  return signature;
+}
+
+// メインのハンドラー関数
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  
+  // 管理画面へのリクエスト
+  if (path === '/admin') {
+    return serveAdminPage(request);
+  }
+  
+  // ログインへのリクエスト
+  if (path === '/login') {
+    return handleLogin(request);
+  }
+  
+  // APIリクエスト
+  if (path.startsWith('/api/')) {
+    return handleAPIRequest(request);
+  }
+  
+  // 通常のページリクエスト
+  return servePage(request);
+}
+
+// ログインの処理
+async function handleLogin(request) {
+  if (request.method === 'POST') {
+    try {
+      const formData = await request.formData();
+      const username = formData.get('username');
+      const password = formData.get('password');
+      
+      // 実際の環境では、KVなどからユーザー情報を取得して検証してください
+      // この例では、ハードコードされたユーザー情報を使用します
+      if (username === 'admin' && password === 'password') {
+        const token = generateJWT(username, true);
+        
+        return new Response(JSON.stringify({ success: true, token }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Set-Cookie': `auth=${token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=86400`
+          }
+        });
+      }
+      
+      return new Response(JSON.stringify({ success: false, message: 'ユーザー名またはパスワードが無効です' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ success: false, message: 'ログイン処理中にエラーが発生しました' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+  
+  return new Response(loginPageHTML, {
+    headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+  });
+}
+
+// ページ表示の処理
+async function servePage(request) {
+  const url = new URL(request.url);
+  let pageId = url.pathname.slice(1);
+  
+  if (pageId === '') {
+    pageId = 'index';
+  }
+  
+  // ページのコンテンツを取得
+  let pageContent;
+  try {
+    // 実際の環境では、KVからコンテンツを取得します
+    // const storedContent = await SITE_CONTENT.get(pageId);
+    // pageContent = storedContent ? JSON.parse(storedContent) : DEFAULT_CONTENT[pageId];
+    
+    // この例では、デフォルトのコンテンツを使用します
+    pageContent = DEFAULT_CONTENT[pageId];
+  } catch (e) {
+    pageContent = null;
+  }
+  
+  if (!pageContent) {
+    return new Response('ページが見つかりませんでした', { status: 404 });
+  }
+  
+  // ナビゲーションメニューを作成
+  let navLinks = '';
+  for (const [id, page] of Object.entries(DEFAULT_CONTENT)) {
+    navLinks += `<li><a href="/${id === 'index' ? '' : id}">${page.title}</a></li>`;
+  }
+  
+  const html = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${pageContent.title}</title>
+  <style>
+    body {
+      font-family: 'Arial', sans-serif;
+      line-height: 1.6;
+      margin: 0;
+      padding: 0;
+      color: #333;
+    }
+    header {
+      background-color: #4a6fa5;
+      color: white;
+      padding: 1rem;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    nav {
+      background-color: #f8f9fa;
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid #e9ecef;
+    }
+    nav ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+    }
+    nav li {
+      margin-right: 1rem;
+    }
+    nav a {
+      text-decoration: none;
+      color: #495057;
+      font-weight: 500;
+    }
+    nav a:hover {
+      color: #228be6;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+    footer {
+      background-color: #f8f9fa;
+      text-align: center;
+      padding: 1rem;
+      margin-top: 2rem;
+      border-top: 1px solid #e9ecef;
+    }
+    input, textarea {
+      width: 100%;
+      padding: 0.5rem;
+      margin-bottom: 1rem;
+      border: 1px solid #ced4da;
+      border-radius: 0.25rem;
+    }
+    button {
+      background-color: #4a6fa5;
+      color: white;
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 0.25rem;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #3a5a8f;
+    }
+    #login-link {
+      float: right;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>マイウェブサイト</h1>
+      <a id="login-link" href="/admin">管理画面</a>
+    </div>
+  </header>
+  <nav>
+    <div class="container">
+      <ul>
+        ${navLinks}
+      </ul>
+    </div>
+  </nav>
+  <main class="container">
+    ${pageContent.content}
+  </main>
+  <footer>
+    <div class="container">
+      <p>&copy; 2025 マイウェブサイト. All rights reserved.</p>
+    </div>
+  </footer>
+</body>
+</html>
+  `;
+  
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+  });
+}
+
+// 管理画面の表示
+async function serveAdminPage(request) {
+  // トークンを検証
+  const token = getCookieValue(request.headers.get('Cookie'), 'auth');
+  const userData = token ? verifyJWT(token) : null;
+  
+  if (!userData || !userData.isAdmin) {
+    return Response.redirect(`${new URL(request.url).origin}/login`, 302);
+  }
+  
+  // ページのリストを取得
+  const pages = Object.entries(DEFAULT_CONTENT).map(([id, page]) => ({
+    id,
+    title: page.title
+  }));
+  
+  const html = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理画面</title>
+  <style>
+    body {
+      font-family: 'Arial', sans-serif;
+      line-height: 1.6;
+      margin: 0;
+      padding: 0;
+      color: #333;
+    }
+    header {
+      background-color: #4a6fa5;
+      color: white;
+      padding: 1rem;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+    .admin-panel {
+      display: grid;
+      grid-template-columns: 250px 1fr;
+      gap: 2rem;
+    }
+    .page-list {
+      background-color: #f8f9fa;
+      padding: 1rem;
+      border-radius: 0.25rem;
+    }
+    .page-list ul {
+      list-style: none;
+      padding: 0;
+    }
+    .page-list li {
+      margin-bottom: 0.5rem;
+    }
+    .page-list a {
+      text-decoration: none;
+      color: #495057;
+      cursor: pointer;
+    }
+    .page-list a:hover {
+      color: #228be6;
+    }
+    .editor {
+      border: 1px solid #ced4da;
+      border-radius: 0.25rem;
+      padding: 1rem;
+    }
+    input, textarea {
+      width: 100%;
+      padding: 0.5rem;
+      margin-bottom: 1rem;
+      border: 1px solid #ced4da;
+      border-radius: 0.25rem;
+    }
+    textarea {
+      min-height: 300px;
+    }
+    button {
+      background-color: #4a6fa5;
+      color: white;
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 0.25rem;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #3a5a8f;
+    }
+    .buttons {
+      display: flex;
+      justify-content: space-between;
+    }
+    #logout-btn {
+      background-color: #dc3545;
+    }
+    #logout-btn:hover {
+      background-color: #c82333;
+    }
+    #preview {
+      margin-top: 1rem;
+      padding: 1rem;
+      border: 1px dashed #ced4da;
+      border-radius: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>ウェブサイト管理画面</h1>
+    </div>
+  </header>
+  <main class="container">
+    <div class="admin-panel">
+      <div class="page-list">
+        <h2>ページ一覧</h2>
+        <ul>
+          ${pages.map(page => `<li><a onclick="loadPage('${page.id}')">${page.title}</a></li>`).join('')}
+        </ul>
+        <button onclick="createNewPage()">新規ページを作成</button>
+      </div>
+      <div class="editor">
+        <h2>ページエディタ</h2>
+        <div>
+          <label for="page-title">タイトル:</label>
+          <input type="text" id="page-title">
+        </div>
+        <div>
+          <label for="page-id">ページID:</label>
+          <input type="text" id="page-id">
+        </div>
+        <div>
+          <label for="page-content">コンテンツ (HTML):</label>
+          <textarea id="page-content"></textarea>
+        </div>
+        <div class="buttons">
+          <div>
+            <button onclick="savePage()">保存</button>
+            <button onclick="previewPage()">プレビュー</button>
+          </div>
+          <button id="logout-btn" onclick="logout()">ログアウト</button>
+        </div>
+        <div id="preview"></div>
+      </div>
+    </div>
+  </main>
+  
+  <script>
+    let currentPageId = null;
+    
+    // ページデータの初期化
+    const pageData = ${JSON.stringify(DEFAULT_CONTENT)};
+    
+    // ページの読み込み
+    function loadPage(pageId) {
+      currentPageId = pageId;
+      const page = pageData[pageId];
+      
+      document.getElementById('page-title').value = page.title;
+      document.getElementById('page-id').value = pageId;
+      document.getElementById('page-content').value = page.content;
+      document.getElementById('preview').innerHTML = '';
+    }
+    
+    // ページのプレビュー
+    function previewPage() {
+      const content = document.getElementById('page-content').value;
+      document.getElementById('preview').innerHTML = content;
+    }
+    
+    // ページの保存
+    async function savePage() {
+      const pageId = document.getElementById('page-id').value;
+      const title = document.getElementById('page-title').value;
+      const content = document.getElementById('page-content').value;
+      
+      if (!pageId || !title) {
+        alert('ページIDとタイトルは必須です');
+        return;
+      }
+      
+      try {
+        const response = await fetch('/api/pages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            id: pageId,
+            title,
+            content
+          })
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+          alert('ページが保存されました');
+          pageData[pageId] = { title, content };
+          
+          // 新しいページの場合、リストを更新
+          if (pageId !== currentPageId) {
+            location.reload();
+          }
+        } else {
+          alert('エラー: ' + result.message);
+        }
+      } catch (e) {
+        alert('保存中にエラーが発生しました');
+        console.error(e);
+      }
+    }
+    
+    // 新規ページの作成
+    function createNewPage() {
+      currentPageId = null;
+      document.getElementById('page-title').value = '';
+      document.getElementById('page-id').value = '';
+      document.getElementById('page-content').value = '<h1>新しいページ</h1><p>ここにコンテンツを入力してください。</p>';
+      document.getElementById('preview').innerHTML = '';
+    }
+    
+    // ログアウト
+    function logout() {
+      document.cookie = 'auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+      window.location.href = '/';
+    }
+    
+    // 最初のページを読み込む
+    if (Object.keys(pageData).length > 0) {
+      loadPage('index');
+    }
+  </script>
+</body>
+</html>
+  `;
+  
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+  });
+}
+
+// APIリクエストの処理
+async function handleAPIRequest(request) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  
+  // トークンを検証
+  const token = getCookieValue(request.headers.get('Cookie'), 'auth');
+  const userData = token ? verifyJWT(token) : null;
+  
+  if (!userData || !userData.isAdmin) {
+    return new Response(JSON.stringify({ success: false, message: '認証が必要です' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  // ページの保存
+  if (path === '/api/pages' && request.method === 'POST') {
+    try {
+      const { id, title, content } = await request.json();
+      
+      if (!id || !title) {
+        return new Response(JSON.stringify({ success: false, message: 'IDとタイトルは必須です' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // 実際の環境では、KVにコンテンツを保存します
+      // await SITE_CONTENT.put(id, JSON.stringify({ title, content }));
+      
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ success: false, message: 'エラーが発生しました' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+  
+  return new Response(JSON.stringify({ success: false, message: '無効なリクエストです' }), {
+    status: 400,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// クッキーからの値の取得
+function getCookieValue(cookieString, name) {
+  if (!cookieString) return null;
+  
+  const match = cookieString.match(new RegExp(`(^| )${name}=([^;]+)`));
+  return match ? match[2] : null;
+}
+
+// ログインページのHTML
+const loginPageHTML = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ログイン</title>
+  <style>
+    body {
+      font-family: 'Arial', sans-serif;
+      line-height: 1.6;
+      margin: 0;
+      padding: 0;
+      color: #333;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      background-color: #f8f9fa;
+    }
+    .login-container {
+      width: 100%;
+      max-width: 400px;
+      padding: 2rem;
+      background-color: white;
+      border-radius: 0.5rem;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 2rem;
+      color: #4a6fa5;
+    }
+    input {
+      width: 100%;
+      padding: 0.5rem;
+      margin-bottom: 1rem;
+      border: 1px solid #ced4da;
+      border-radius: 0.25rem;
+    }
+    button {
+      width: 100%;
+      background-color: #4a6fa5;
+      color: white;
+      border: none;
+      padding: 0.75rem;
+      border-radius: 0.25rem;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    button:hover {
+      background-color: #3a5a8f;
+    }
+    .error-message {
+      color: #dc3545;
+      margin-bottom: 1rem;
+      display: none;
+    }
+    .back-link {
+      text-align: center;
+      margin-top: 1rem;
+    }
+    .back-link a {
+      color: #4a6fa5;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <h1>管理者ログイン</h1>
+    <div id="error-message" class="error-message"></div>
+    <form id="login-form">
+      <div>
+        <label for="username">ユーザー名:</label>
+        <input type="text" id="username" name="username" required>
+      </div>
+      <div>
+        <label for="password">パスワード:</label>
+        <input type="password" id="password" name="password" required>
+      </div>
+      <button type="submit">ログイン</button>
+    </form>
+    <div class="back-link">
+      <a href="/">ウェブサイトに戻る</a>
+    </div>
+  </div>
+  
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      
+      try {
+        const response = await fetch('/login', {
+          method: 'POST',
+          body: new FormData(document.getElementById('login-form'))
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+          window.location.href = '/admin';
+        } else {
+          const errorMessage = document.getElementById('error-message');
+          errorMessage.textContent = result.message || 'ログインに失敗しました';
+          errorMessage.style.display = 'block';
+        }
+      } catch (e) {
+        const errorMessage = document.getElementById('error-message');
+        errorMessage.textContent = 'エラーが発生しました';
+        errorMessage.style.display = 'block';
+        console.error(e);
+      }
+    });
+  </script>
+</body>
+</html>
+`;
+
+// リクエストハンドラーをエクスポート
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
