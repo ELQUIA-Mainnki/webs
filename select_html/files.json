@@ -4,6 +4,10 @@
         "path": "/files/showing.html"
     },
     {
+        "name": "KAEDESERVER_second",
+        "path": "/files/kaede/test2.html"
+    },
+    {
         "name": "KAEDESERVER",
         "path": "/files/kaede/test.html"
     }
