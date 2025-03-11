@@ -1,18 +1,11 @@
 // Cloudflare Worker編集可能ウェブサイト
 
-// 認証用のシークレットキー（実際には環境変数として設定してください）
-const AUTH_SECRET = "change-this-to-a-secure-secret";
+// 環境変数からシークレットを取得
+// これらは Cloudflare ダッシュボードで設定します
+// 環境変数はコードには保存されず、Cloudflare の安全な環境で管理されます
+// wrangler.toml ファイルでのローカル開発時のみ .dev.vars で定義できます
 
-// ユーザーデータを保存するためのKVストア名（Cloudflareのダッシュボードで作成する必要があります）
-// const USERS = YOUR_KV_NAMESPACE; // 実際の使用時にはコメントを外し、適切なKV名前空間を指定してください
-
-// サイトのコンテンツを保存するためのKVストア名
-// const SITE_CONTENT = YOUR_CONTENT_KV_NAMESPACE; // 実際の使用時にはコメントを外し、適切なKV名前空間を指定してください
-
-// JWT署名用のキー（実際には環境変数として設定してください）
-const JWT_SECRET = "change-this-to-a-secure-jwt-secret";
-
-// HTMLテンプレート
+// HTML テンプレート
 const DEFAULT_CONTENT = {
   "index": {
     "title": "ホームページ",
@@ -29,7 +22,7 @@ const DEFAULT_CONTENT = {
 };
 
 // JWT関連の関数
-function generateJWT(username, isAdmin) {
+function generateJWT(username, isAdmin, env) {
   const header = {
     alg: "HS256",
     typ: "JWT"
@@ -46,17 +39,18 @@ function generateJWT(username, isAdmin) {
   const headerEncoded = btoa(JSON.stringify(header));
   const payloadEncoded = btoa(JSON.stringify(payload));
   
-  const signature = generateSignature(`${headerEncoded}.${payloadEncoded}`, JWT_SECRET);
+  // 環境変数から JWT_SECRET を使用
+  const signature = generateSignature(`${headerEncoded}.${payloadEncoded}`, env.JWT_SECRET);
   
   return `${headerEncoded}.${payloadEncoded}.${signature}`;
 }
 
-function verifyJWT(token) {
+function verifyJWT(token, env) {
   try {
     const [headerEncoded, payloadEncoded, signature] = token.split('.');
     
-    // 署名を検証
-    const expectedSignature = generateSignature(`${headerEncoded}.${payloadEncoded}`, JWT_SECRET);
+    // 署名を検証（環境変数から JWT_SECRET を使用）
+    const expectedSignature = generateSignature(`${headerEncoded}.${payloadEncoded}`, env.JWT_SECRET);
     if (signature !== expectedSignature) {
       return null;
     }
@@ -87,41 +81,47 @@ function generateSignature(data, secret) {
 }
 
 // メインのハンドラー関数
-async function handleRequest(request) {
+export default {
+  async fetch(request, env, ctx) {
+    return await handleRequest(request, env);
+  }
+};
+
+async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   
   // 管理画面へのリクエスト
   if (path === '/admin') {
-    return serveAdminPage(request);
+    return serveAdminPage(request, env);
   }
   
   // ログインへのリクエスト
   if (path === '/login') {
-    return handleLogin(request);
+    return handleLogin(request, env);
   }
   
   // APIリクエスト
   if (path.startsWith('/api/')) {
-    return handleAPIRequest(request);
+    return handleAPIRequest(request, env);
   }
   
   // 通常のページリクエスト
-  return servePage(request);
+  return servePage(request, env);
 }
 
 // ログインの処理
-async function handleLogin(request) {
+async function handleLogin(request, env) {
   if (request.method === 'POST') {
     try {
       const formData = await request.formData();
       const username = formData.get('username');
       const password = formData.get('password');
       
-      // 実際の環境では、KVなどからユーザー情報を取得して検証してください
-      // この例では、ハードコードされたユーザー情報を使用します
-      if (username === 'admin' && password === 'password') {
-        const token = generateJWT(username, true);
+      // 環境変数からユーザー認証情報を取得
+      // 本番環境では KV から取得するか、より安全な認証方法を使用
+      if (username === env.ADMIN_USERNAME && password === env.ADMIN_PASSWORD) {
+        const token = generateJWT(username, true, env);
         
         return new Response(JSON.stringify({ success: true, token }), {
           headers: {
@@ -149,7 +149,7 @@ async function handleLogin(request) {
 }
 
 // ページ表示の処理
-async function servePage(request) {
+async function servePage(request, env) {
   const url = new URL(request.url);
   let pageId = url.pathname.slice(1);
   
@@ -160,12 +160,18 @@ async function servePage(request) {
   // ページのコンテンツを取得
   let pageContent;
   try {
-    // 実際の環境では、KVからコンテンツを取得します
-    // const storedContent = await SITE_CONTENT.get(pageId);
-    // pageContent = storedContent ? JSON.parse(storedContent) : DEFAULT_CONTENT[pageId];
-    
-    // この例では、デフォルトのコンテンツを使用します
-    pageContent = DEFAULT_CONTENT[pageId];
+    // KV からコンテンツを取得
+    if (env.SITE_CONTENT) {
+      const storedContent = await env.SITE_CONTENT.get(pageId);
+      if (storedContent) {
+        pageContent = JSON.parse(storedContent);
+      } else {
+        pageContent = DEFAULT_CONTENT[pageId];
+      }
+    } else {
+      // 環境変数が設定されていない場合はデフォルトコンテンツを使用
+      pageContent = DEFAULT_CONTENT[pageId];
+    }
   } catch (e) {
     pageContent = null;
   }
@@ -197,7 +203,6 @@ async function servePage(request) {
       margin: 0;
       padding: 0;
       color: #333;
-      overflow-x: hidden; /* 横スクロール防止 */
     }
     header {
       background-color: #4a6fa5;
@@ -317,20 +322,38 @@ async function servePage(request) {
 }
 
 // 管理画面の表示
-async function serveAdminPage(request) {
+async function serveAdminPage(request, env) {
   // トークンを検証
   const token = getCookieValue(request.headers.get('Cookie'), 'auth');
-  const userData = token ? verifyJWT(token) : null;
+  const userData = token ? verifyJWT(token, env) : null;
   
   if (!userData || !userData.isAdmin) {
     return Response.redirect(`${new URL(request.url).origin}/login`, 302);
   }
   
-  // ページのリストを取得
+  // ページのリストを作成
   const pages = Object.entries(DEFAULT_CONTENT).map(([id, page]) => ({
     id,
     title: page.title
   }));
+  
+  // KV から追加のページを取得
+  if (env.SITE_CONTENT) {
+    try {
+      const keys = await env.SITE_CONTENT.list();
+      for (const key of keys.keys) {
+        if (!DEFAULT_CONTENT[key.name]) {
+          const content = await env.SITE_CONTENT.get(key.name);
+          if (content) {
+            const page = JSON.parse(content);
+            pages.push({ id: key.name, title: page.title });
+          }
+        }
+      }
+    } catch (e) {
+      console.error('KV からページ一覧の取得に失敗しました:', e);
+    }
+  }
   
   const html = `
 <!DOCTYPE html>
@@ -349,7 +372,7 @@ async function serveAdminPage(request) {
       margin: 0;
       padding: 0;
       color: #333;
-      overflow-x: hidden;
+      overflow-x: hidden; /* 横スクロール防止 */
     }
     header {
       background-color: #4a6fa5;
@@ -442,8 +465,7 @@ async function serveAdminPage(request) {
       width: 100%;
       overflow-x: auto; /* プレビュー内の横スクロール許可 */
     }
-    
-    /* スマホ対応の追加 */
+
     @media (max-width: 768px) {
       .buttons {
         flex-direction: column;
@@ -502,13 +524,29 @@ async function serveAdminPage(request) {
     const pageData = ${JSON.stringify(DEFAULT_CONTENT)};
     
     // ページの読み込み
-    function loadPage(pageId) {
+    async function loadPage(pageId) {
       currentPageId = pageId;
-      const page = pageData[pageId];
       
-      document.getElementById('page-title').value = page.title;
-      document.getElementById('page-id').value = pageId;
-      document.getElementById('page-content').value = page.content;
+      try {
+        // APIからページデータを取得
+        const response = await fetch(\`/api/pages/\${pageId}\`);
+        if (response.ok) {
+          const page = await response.json();
+          document.getElementById('page-title').value = page.title;
+          document.getElementById('page-id').value = pageId;
+          document.getElementById('page-content').value = page.content;
+        } else {
+          // APIから取得できない場合はデフォルトデータを使用
+          const page = pageData[pageId];
+          document.getElementById('page-title').value = page.title;
+          document.getElementById('page-id').value = pageId;
+          document.getElementById('page-content').value = page.content;
+        }
+      } catch (e) {
+        console.error('ページ読み込み中にエラーが発生しました:', e);
+        alert('ページの読み込みに失敗しました');
+      }
+      
       document.getElementById('preview').innerHTML = '';
     }
     
@@ -546,6 +584,7 @@ async function serveAdminPage(request) {
         
         if (result.success) {
           alert('ページが保存されました');
+          // ローカルのページデータを更新
           pageData[pageId] = { title, content };
           
           // 新しいページの場合、リストを更新
@@ -606,19 +645,56 @@ async function serveAdminPage(request) {
 }
 
 // APIリクエストの処理
-async function handleAPIRequest(request) {
+async function handleAPIRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   
   // トークンを検証
   const token = getCookieValue(request.headers.get('Cookie'), 'auth');
-  const userData = token ? verifyJWT(token) : null;
+  const userData = token ? verifyJWT(token, env) : null;
   
   if (!userData || !userData.isAdmin) {
     return new Response(JSON.stringify({ success: false, message: '認証が必要です' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
     });
+  }
+  
+  // ページの取得
+  if (path.startsWith('/api/pages/') && request.method === 'GET') {
+    const pageId = path.replace('/api/pages/', '');
+    
+    try {
+      let pageContent;
+      
+      // KVからページ情報を取得
+      if (env.SITE_CONTENT) {
+        const storedContent = await env.SITE_CONTENT.get(pageId);
+        if (storedContent) {
+          pageContent = JSON.parse(storedContent);
+        } else {
+          pageContent = DEFAULT_CONTENT[pageId];
+        }
+      } else {
+        pageContent = DEFAULT_CONTENT[pageId];
+      }
+      
+      if (!pageContent) {
+        return new Response(JSON.stringify({ success: false, message: 'ページが見つかりません' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      return new Response(JSON.stringify(pageContent), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ success: false, message: 'エラーが発生しました' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   }
   
   // ページの保存
@@ -633,8 +709,12 @@ async function handleAPIRequest(request) {
         });
       }
       
-      // 実際の環境では、KVにコンテンツを保存します
-      // await SITE_CONTENT.put(id, JSON.stringify({ title, content }));
+      // KVにコンテンツを保存
+      if (env.SITE_CONTENT) {
+        await env.SITE_CONTENT.put(id, JSON.stringify({ title, content }));
+      } else {
+        console.warn('KV名前空間が設定されていないため、コンテンツは一時的にのみ保存されます');
+      }
       
       return new Response(JSON.stringify({ success: true }), {
         headers: { 'Content-Type': 'application/json' }
@@ -752,43 +832,3 @@ const loginPageHTML = `
     <div class="back-link">
       <a href="/">ウェブサイトに戻る</a>
     </div>
-  </div>
-  
-  <script>
-    document.getElementById('login-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      
-      const username = document.getElementById('username').value;
-      const password = document.getElementById('password').value;
-      
-      try {
-        const response = await fetch('/login', {
-          method: 'POST',
-          body: new FormData(document.getElementById('login-form'))
-        });
-        
-        const result = await response.json();
-        
-        if (result.success) {
-          window.location.href = '/admin';
-        } else {
-          const errorMessage = document.getElementById('error-message');
-          errorMessage.textContent = result.message || 'ログインに失敗しました';
-          errorMessage.style.display = 'block';
-        }
-      } catch (e) {
-        const errorMessage = document.getElementById('error-message');
-        errorMessage.textContent = 'エラーが発生しました';
-        errorMessage.style.display = 'block';
-        console.error(e);
-      }
-    });
-  </script>
-</body>
-</html>
-`;
-
-// リクエストハンドラーをエクスポート
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
